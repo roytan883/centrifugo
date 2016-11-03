@@ -269,6 +269,25 @@ func (c *client) Send(message []byte) error {
 	return nil
 }
 
+func (c *client) Disconnect(reason string, reconnect bool) error {
+	body := proto.DisconnectBody{
+		Reason:    reason,
+		Reconnect: reconnect,
+	}
+	resp := proto.NewClientDisconnectResponse(body)
+	jsonResp, err := json.Marshal(resp)
+	if err != nil {
+		return err
+	}
+	c.Lock()
+	if c.closed {
+		return nil
+	}
+	c.Unlock()
+	c.Send(jsonResp)
+	return c.Close(reason)
+}
+
 // clean called when connection was closed to make different clean up
 // actions for a client
 func (c *client) Close(reason string) error {
@@ -299,9 +318,6 @@ func (c *client) Close(reason string) error {
 		}
 	}
 
-	c.messages.Close()
-	c.sess.Close(CloseStatus, reason)
-
 	if c.authenticated {
 		err := c.node.RemoveClientConn(c)
 		if err != nil {
@@ -324,6 +340,17 @@ func (c *client) Close(reason string) error {
 	if c.staleTimer != nil {
 		c.staleTimer.Stop()
 	}
+
+	// Interval to sleep before closing connection to give client a chance to receive
+	// queued messages and process it. Connection will be closed then. This is required
+	// because we send messages from client queue in separate goroutine.
+	if reason != "" {
+		waitBeforeClose := time.Second
+		time.Sleep(waitBeforeClose)
+	}
+
+	c.messages.Close()
+	c.sess.Close(CloseStatus, reason)
 
 	return nil
 }
@@ -355,27 +382,20 @@ func (c *client) Handle(msg []byte) error {
 	}()
 	plugin.Metrics.Counters.Add("client_bytes_in", int64(len(msg)))
 
-	// Interval to sleep before closing connection to give client a chance to receive
-	// disconnect message and process it. Connection will be closed then.
-	waitBeforeClose := time.Second
-
 	if len(msg) == 0 {
 		logger.ERROR.Println("empty client request received")
-		c.disconnect(proto.ErrInvalidMessage.Error(), false)
-		time.Sleep(waitBeforeClose)
+		c.Disconnect(proto.ErrInvalidMessage.Error(), false)
 		return proto.ErrInvalidMessage
 	} else if len(msg) > c.maxRequestSize {
 		logger.ERROR.Println("client request exceeds max request size limit")
-		c.disconnect(proto.ErrLimitExceeded.Error(), false)
-		time.Sleep(waitBeforeClose)
+		c.Disconnect(proto.ErrLimitExceeded.Error(), false)
 		return proto.ErrLimitExceeded
 	}
 
 	commands, err := clientCommandsFromJSON(msg)
 	if err != nil {
 		logger.ERROR.Println(err)
-		c.disconnect(proto.ErrInvalidMessage.Error(), false)
-		time.Sleep(waitBeforeClose)
+		c.Disconnect(proto.ErrInvalidMessage.Error(), false)
 		return proto.ErrInvalidMessage
 	}
 
@@ -383,8 +403,7 @@ func (c *client) Handle(msg []byte) error {
 		// Nothing to do - in normal workflow such commands should never come.
 		// Let's be strict here to prevent client sending useless messages.
 		logger.ERROR.Println("got request from client without commands")
-		c.disconnect(proto.ErrInvalidMessage.Error(), false)
-		time.Sleep(waitBeforeClose)
+		c.Disconnect(proto.ErrInvalidMessage.Error(), false)
 		return proto.ErrInvalidMessage
 	}
 
@@ -396,25 +415,9 @@ func (c *client) Handle(msg []byte) error {
 			// Any other error results in disconnect without reconnect.
 			reconnect = true
 		}
-		c.disconnect(err.Error(), reconnect)
-		if !reconnect {
-			time.Sleep(waitBeforeClose)
-		}
+		c.Disconnect(err.Error(), reconnect)
 	}
 	return err
-}
-
-func (c *client) disconnect(reason string, reconnect bool) error {
-	body := proto.DisconnectBody{
-		Reason:    reason,
-		Reconnect: reconnect,
-	}
-	resp := proto.NewClientDisconnectResponse(body)
-	jsonResp, err := json.Marshal(resp)
-	if err != nil {
-		return err
-	}
-	return c.Send(jsonResp)
 }
 
 func (c *client) handleCommands(cmds []proto.ClientCommand) error {

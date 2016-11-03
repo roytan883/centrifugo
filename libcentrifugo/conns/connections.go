@@ -15,6 +15,8 @@ type ClientConn interface {
 	Send(message []byte) error
 	// Unsubscribe allows to unsubscribe connection from channel.
 	Unsubscribe(ch string) error
+	// Disconnect
+	Disconnect(reason string, reconnect bool) error
 	// Close closes client's connection.
 	Close(reason string) error
 }
